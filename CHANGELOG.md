@@ -2,6 +2,11 @@
 
 IMPROVEMENTS:
 * build: Updated to Go 1.27.2 [[GH-1359](https://github.com/hashicorp/nomad-autoscaler/pull/1359)]
+* policy: Cooldown is now driven by a single internal scaling event ledger instead of a stored deadline combined with a one-shot timer. The ledger records each event's time, direction, before/after count, source (local or observed out-of-band) and dry-run flag; out-of-band events infer their direction from the observed count change and fall back to the shorter configured cooldown when the direction is unknown. A bounded stability window records a persistent observed difference as an out-of-band event instead of waiting indefinitely.
+
+BUG FIXES:
+* policy: Fixed a panic when a policy handler started before its target existed: a nil target status is now handled safely and the handler performs its first observation on a later evaluation instead of dereferencing the missing status.
+* policy: Startup out-of-band cooldown now selects the cooldown from the event ledger (the shorter configured cooldown when the direction is unknown) and consistently derives the cooldown deadline, rather than always using `cooldown_on_scale_up` while leaving the deadline unset.
 
 ## 0.6.0 (September 28, 2026)
 

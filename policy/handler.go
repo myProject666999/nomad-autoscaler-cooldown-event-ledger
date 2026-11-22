@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"sync"
 	"time"
 
@@ -92,14 +91,58 @@ type Handler struct {
 	// ticker controls the frequency the policy is sent for evaluation.
 	ticker *time.Ticker
 
+	// now returns the current time. It defaults to the package-level nowFunc so
+	// production behaviour is unchanged, but tests can give each handler a stable
+	// clock that an in-flight scaling goroutine cannot race by reassigning the
+	// shared package variable.
+	now func() time.Time
+
 	stateLock sync.RWMutex
 	state     handlerState
 
 	actionLock sync.RWMutex
 	nextAction sdk.ScalingAction
 
-	cooldownLock    sync.RWMutex
-	outOfCooldownOn time.Time
+	// ledgerLock guards the scaling event ledger and all target observation
+	// and stability bookkeeping. The latest scaling event is the single
+	// source of truth for cooldown; there is no independently stored deadline
+	// and no timer that mutates handler state.
+	ledgerLock sync.RWMutex
+
+	// latestEvent is the most recent scaling event, or nil until one is
+	// recorded. The cooldown deadline is derived from it.
+	latestEvent *scalingEvent
+
+	// Observation state used to detect out-of-band count changes and to gate
+	// scaling until the target stabilises on this process's requested count.
+	hasObserved       bool
+	lastObservedCount int64
+
+	// lastMetaEventNano is the last-event timestamp from the target status
+	// that has already been consumed, so the same meta value is not treated as
+	// a new out-of-band event on every evaluation.
+	lastMetaEventNano int64
+
+	// Outstanding request tracking: once this process submits a scale, the
+	// target is expected to converge on requestedCount. The stability gate
+	// defers further scaling until the observed count matches, and the bounded
+	// inconsistency window prevents an unreachable target from blocking the
+	// handler forever.
+	hasOutstandingRequest bool
+	requestedCount        int64
+	inconsistentSet       bool
+	inconsistentTicks     int
+	windowFromCount       int64
+	windowToCount         int64
+
+	// lastTickStable records whether the most recent evaluation observed a
+	// stable target; the ticker path reads it after releasing ledgerLock to
+	// decide whether a new scale may be launched from Idle.
+	lastTickStable bool
+
+	// scaleWG tracks the goroutines launched to execute waitAndScale so tests
+	// (and handler shutdown) can wait for in-flight scaling to complete.
+	scaleWG sync.WaitGroup
 
 	pm dependencyGetter
 
@@ -132,6 +175,7 @@ func NewPolicyHandler(config HandlerConfig) (*Handler, error) {
 		updatesCh:           config.UpdatesChan,
 		policy:              config.Policy,
 		limiter:             config.Limiter,
+		now:                 nowFunc,
 		stateLock:           sync.RWMutex{},
 		state:               StateIdle,
 		historicalAPMGetter: config.HistoricalAPMGetter,
@@ -147,49 +191,44 @@ func NewPolicyHandler(config HandlerConfig) (*Handler, error) {
 		return nil, fmt.Errorf("failed to get target status: %w", err)
 	}
 
-	// A nil status indicates the target doesn't exist or is not ready, log and
-	// continue
+	// A nil status indicates the target doesn't exist or is not ready. The
+	// handler is still returned: it starts Idle with an empty ledger and
+	// performs its first baseline observation on a later evaluation once the
+	// target appears.
 	if currentStatus == nil {
 		h.log.Warn("target not found", "target", h.policy.Target.Name)
+		return h, nil
 	}
 
-	lastEventTS, err := checkForOutOfBandEvents(currentStatus)
+	// Seed the observation baseline so the first evaluation cannot mistake
+	// the starting count for an out-of-band change.
+	h.hasObserved = true
+	h.lastObservedCount = currentStatus.Count
+
+	lastEventTS, err := parseLastEventTS(currentStatus)
 	if err != nil {
 		h.log.Warn("unable to get out of band event", "target", h.policy.Target.Name,
 			"error", err)
 	}
+	h.lastMetaEventNano = lastEventTS
 
 	if lastEventTS > 0 {
-		// For out of band events, it is impossible to determine the direction
-		// of the last action, assume the shortest period for responsiveness.
-		h.updateState(StateCooldown)
-
-		rcd := calculateRemainingCooldown(h.policy.CooldownOnScaleUp,
-			nowFunc().UTC().UnixNano(), lastEventTS)
-		time.AfterFunc(rcd, func() {
-			h.updateState(StateIdle)
+		// The target reports a scaling event this process did not perform,
+		// typically because the autoscaler was offline or re-deployed. Only a
+		// single status snapshot exists, so the direction and count delta are
+		// unknown; record the observed count as both endpoints and let the
+		// event use the shorter configured cooldown.
+		eventTime := clampEventTime(time.Unix(0, lastEventTS).UTC(), h.nowTime())
+		h.recordEvent(&scalingEvent{
+			time:        eventTime,
+			direction:   sdk.ScaleDirectionNone,
+			countBefore: currentStatus.Count,
+			countAfter:  currentStatus.Count,
+			source:      scalingEventSourceOutOfBand,
 		})
 	}
 
 	return h, nil
-}
-
-// checkForOutOfBandEvents tries to determine if there has been any recent
-// scaling events in case of the autoscaler going offline.
-func checkForOutOfBandEvents(status *sdk.TargetStatus) (int64, error) {
-	// If the target status includes a last event meta key, check for cooldown
-	// due to out-of-band events. This is also useful if the Autoscaler has
-	// been re-deployed.
-	if status.Meta == nil {
-		return 0, nil
-	}
-
-	ts, ok := status.Meta[sdk.TargetStatusMetaKeyLastEvent]
-	if !ok {
-		return 0, nil
-	}
-
-	return strconv.ParseInt(ts, 10, 64)
 }
 
 // applyPolicyState validates and atomically applies policy-derived state.
@@ -303,86 +342,125 @@ func (h *Handler) Run(ctx context.Context) {
 			}
 
 		case <-h.ticker.C:
-			if h.compiledPolicySchedule != nil && !h.compiledPolicySchedule.activeAt(nowFunc()) {
+			if h.compiledPolicySchedule != nil && !h.compiledPolicySchedule.activeAt(h.nowTime()) {
 				h.log.Info("skipping evaluation, outside schedule window")
 				continue
 			}
 
-			currentStatus, err := h.runTargetStatus()
-			if err != nil {
-				h.log.Error("encountered a runtime error while executing the policy",
-					"error", fmt.Errorf("handler: failed to get target status for target: %s, %w",
-						h.policy.Target.Name, err))
-				continue
-			}
-
-			// A nil status indicates the target doesn't exist, log and return.
-			if currentStatus == nil {
-				h.log.Error("encountered a runtime error while executing the policy", "error", errTargetNotFound)
-				continue
-			}
-
-			if !currentStatus.Ready {
-				h.log.Debug("skipping evaluation, target not ready")
-				continue
-			}
-
-			currentCount := currentStatus.Count
-			action, err := h.calculateNewCount(ctx, currentCount)
-			if err != nil {
-				// Returning here avoids re-entering the ticker case on a canceled/expired context;
-				//  ctx.Done() would win on the next iteration anyway but Go's select is non-deterministic.
-				if ctx.Err() != nil {
-					h.log.Debug("stopping policy handler, context done during evaluation")
-					return
-				}
-				h.log.Error("encountered a runtime error while executing the policy",
-					"error", fmt.Errorf("handler: unable to execute policy ID: %s, %w",
-						h.policy.ID, err))
-				continue
-			}
-
-			h.log.Info("calculating scaling target", "policy_id", h.policy.ID,
-				"from", currentCount, "to",
-				action.Count, "reason", action.Reason, "meta", action.Meta)
-
-			if !scalingNeeded(action, currentCount) {
-				h.log.Info("skipping scaling, no action needed")
-				continue
-			}
-
-			h.updateNextAction(action)
-
-			if nowFunc().After(h.getOutOfCooldownOn()) &&
-				h.getState() == StateCooldown {
-				h.updateState(StateIdle)
-			}
-
-			switch h.getState() {
-			case StateCooldown:
-				h.log.Info("skipping scaling, policy still on cooldown", "remaining",
-					time.Until(h.getOutOfCooldownOn()))
-
-			case StateWaitingTurn:
-				h.log.Debug("updating action, waiting to execute")
-
-			case StateScaling:
-				h.log.Info("skipping scaling, target still scaling")
-
-			case StateIdle:
-				h.log.Debug("requesting slot")
-				h.updateState(StateWaitingTurn)
-
-				go func() {
-					err := h.waitAndScale(ctx)
-					if err != nil {
-						h.updateState(StateIdle)
-						h.log.Error("unable to scale target", "reason", err)
-					}
-				}()
-			}
+			h.evaluateOne(ctx)
 		}
 	}
+}
+
+// evaluateOne runs a single policy evaluation: it reads the target, reconciles
+// observed changes against the scaling event ledger, calculates a new desired
+// count, and either launches a scale or defers while cooling down or waiting
+// for the target to stabilise. It is extracted from Run so the evaluation
+// logic can be driven deterministically in tests.
+func (h *Handler) evaluateOne(ctx context.Context) {
+	currentStatus, err := h.runTargetStatus()
+	if err != nil {
+		h.log.Error("encountered a runtime error while executing the policy",
+			"error", fmt.Errorf("handler: failed to get target status for target: %s, %w",
+				h.policy.Target.Name, err))
+		return
+	}
+
+	// A nil status indicates the target doesn't exist; leave the observation
+	// baseline untouched so a later appearance is evaluated from a clean state.
+	if currentStatus == nil {
+		h.log.Error("encountered a runtime error while executing the policy", "error", errTargetNotFound)
+		return
+	}
+
+	if !currentStatus.Ready {
+		h.log.Debug("skipping evaluation, target not ready")
+		return
+	}
+
+	now := h.nowTime()
+
+	// Reconcile the observed target state against the ledger: detect
+	// out-of-band changes and run the bounded stability gate. This may record
+	// events that reset the cooldown.
+	h.reconcileObservation(currentStatus, now)
+
+	currentCount := currentStatus.Count
+	action, err := h.calculateNewCount(ctx, currentCount)
+	if err != nil {
+		// Returning here avoids re-entering the ticker case on a canceled/expired context;
+		//  ctx.Done() would win on the next iteration anyway but Go's select is non-deterministic.
+		if ctx.Err() != nil {
+			h.log.Debug("stopping policy handler, context done during evaluation")
+			return
+		}
+		h.log.Error("encountered a runtime error while executing the policy",
+			"error", fmt.Errorf("handler: unable to execute policy ID: %s, %w",
+				h.policy.ID, err))
+		return
+	}
+
+	h.log.Info("calculating scaling target", "policy_id", h.policy.ID,
+		"from", currentCount, "to",
+		action.Count, "reason", action.Reason, "meta", action.Meta)
+
+	if !scalingNeeded(action, currentCount) {
+		// A no-op recommendation records no event and enters no cooldown.
+		h.log.Info("skipping scaling, no action needed")
+		return
+	}
+
+	h.updateNextAction(action)
+
+	if h.getState() == StateCooldown && h.cooldownExpired(now) {
+		h.updateState(StateIdle)
+	}
+
+	switch h.getState() {
+	case StateCooldown:
+		h.log.Info("skipping scaling, policy still on cooldown", "remaining",
+			h.remainingCooldownUntil(now))
+
+	case StateWaitingTurn:
+		h.log.Debug("updating action, waiting to execute")
+
+	case StateScaling:
+		h.log.Info("skipping scaling, target still scaling")
+
+	case StateIdle:
+		// While a previous request has not yet been confirmed stable, defer
+		// launching another scale. The bounded inconsistency window in
+		// reconcileObservation guarantees this hold cannot last forever.
+		if h.stabilityHold() {
+			h.log.Debug("deferring scaling, target not stable",
+				"observed", currentCount, "requested", h.getRequestedCount())
+			return
+		}
+
+		h.log.Debug("requesting slot")
+		// Track the requested count so the stability gate can confirm the
+		// target converges. Dry-run actions leave the count untouched and so
+		// do not arm the gate.
+		h.armOutstandingRequest(action.Count, h.isDryRun())
+		h.updateState(StateWaitingTurn)
+
+		h.scaleWG.Add(1)
+		go func() {
+			defer h.scaleWG.Done()
+			err := h.waitAndScale(ctx)
+			if err != nil {
+				h.updateState(StateIdle)
+				h.log.Error("unable to scale target", "reason", err)
+			}
+		}()
+	}
+}
+
+// waitForInFlightScales blocks until every launched scaling goroutine has
+// returned. Tests use it to avoid a scale outliving the evaluation that started
+// it; Run's lifecycle can rely on the same barrier during shutdown.
+func (h *Handler) waitForInFlightScales() {
+	h.scaleWG.Wait()
 }
 
 // scalingNeeded determines if the action requires a change from the current
@@ -401,6 +479,8 @@ func scalingNeeded(a sdk.ScalingAction, currentCount int64) bool {
 func (h *Handler) waitAndScale(ctx context.Context) error {
 	err := h.limiter.GetSlot(ctx, h.policy)
 	if err != nil {
+		// The scale never ran, so no convergence should be expected.
+		h.clearOutstandingRequest()
 		return fmt.Errorf("timeout waiting for execution time: %w", err)
 	}
 
@@ -409,6 +489,15 @@ func (h *Handler) waitAndScale(ctx context.Context) error {
 	h.log.Debug("slot granted")
 
 	action := h.getNextAction()
+
+	// runTargetScale may mutate the action via SetDryRun, which replaces the
+	// count with the dry-run sentinel and clears the direction, so capture the
+	// original values and whether this is a dry run before calling it.
+	dryRun := h.isDryRun()
+	originalDirection := action.Direction
+	originalCount := action.Count
+	beforeCount := h.getLastObservedCount()
+
 	h.updateState(StateScaling)
 
 	// Measure how long it takes to invoke the scaling actions. This helps
@@ -419,24 +508,47 @@ func (h *Handler) waitAndScale(ctx context.Context) error {
 		{Name: "target_name", Value: h.policy.Target.Name},
 	}
 	defer metrics.MeasureSinceWithLabels([]string{"scale", "invoke_ms"},
-		nowFunc(), labels)
+		h.nowTime(), labels)
 
 	err = h.runTargetScale(action)
 	if err != nil {
 		var noOpErr *sdk.TargetScalingNoOpError
 		if errors.As(err, &noOpErr) {
+			// A no-op changes nothing: clear any outstanding request, record
+			// no event and enter no cooldown.
+			h.clearOutstandingRequest()
 			h.log.Debug("scaling action was a no-op, skipping cooldown", "reason", noOpErr.Error())
 			h.updateState(StateIdle)
 			return nil
 		}
+		h.clearOutstandingRequest()
 		return fmt.Errorf("failed to get scale target: %w", err)
 	}
 
-	h.updateState(StateCooldown)
-	cd := calculateCooldown(h.policy, action)
-	h.updateOutOfCooldownOn(nowFunc().Add(cd))
+	// Record the local scaling event. A dry-run keeps its original direction
+	// so its cooldown matches the simulated action, preserving drill cadence,
+	// and is flagged in the ledger.
+	event := &scalingEvent{
+		time:        h.nowTime(),
+		direction:   originalDirection,
+		countBefore: beforeCount,
+		countAfter:  originalCount,
+		source:      scalingEventSourceLocal,
+		dryRun:      dryRun,
+	}
+	if dryRun {
+		event.countAfter = sdk.StrategyActionMetaValueDryRunCount
+	}
+	cd := h.recordEvent(event)
+
+	// With a zero cooldown the event imposes no waiting; return straight to
+	// Idle rather than lingering in Cooldown until the next evaluation.
+	if cd <= 0 {
+		h.updateState(StateIdle)
+	}
+
 	h.log.Debug("successfully submitted scaling action to target, scaling policy has been placed into cooldown",
-		"desired_count", action.Count, "cooldown", cd)
+		"desired_count", originalCount, "cooldown", cd, "dry_run", dryRun)
 
 	return nil
 }
@@ -465,6 +577,15 @@ func (h *Handler) updateHandler(updatedPolicy *sdk.ScalingPolicy) error {
 		h.ticker = time.NewTicker(updatedPolicy.EvaluationInterval)
 	}
 
+	// The cooldown deadline is derived from the latest event and the current
+	// policy, so a new cooldown configuration takes effect on the next read
+	// without storing any deadline. Surface the recomputed value when an event
+	// is still on the ledger.
+	if deadline, ok := h.currentCooldownDeadline(); ok {
+		h.log.Debug("cooldown deadline recomputed after policy update",
+			"policy_id", updatedPolicy.ID, "deadline", deadline)
+	}
+
 	h.log.Debug("check handlers updated", "count", len(h.checkRunners))
 	return nil
 }
@@ -487,7 +608,7 @@ func (h *Handler) calculateNewCount(ctx context.Context, currentCount int64) (sd
 
 	// Record the start time of the eval portion of this function. The labels
 	// are also used across multiple metrics, so define them.
-	evalStartTime := nowFunc()
+	evalStartTime := h.nowTime()
 	labels := []metrics.Label{
 		{Name: "policy_id", Value: h.policy.ID},
 		{Name: "target_name", Value: h.policy.Target.Name},
@@ -578,14 +699,6 @@ func (h *Handler) runTargetScale(action sdk.ScalingAction) error {
 	return nil
 }
 
-func calculateCooldown(p *sdk.ScalingPolicy, a sdk.ScalingAction) time.Duration {
-	if a.Direction == sdk.ScaleDirectionUp {
-		return p.CooldownOnScaleUp
-	}
-
-	return p.Cooldown
-}
-
 // pickWinnerActionFromGroups decide which action wins in the group.
 // The decision processes still picks the safest choice, but it handles `none`
 //
@@ -659,18 +772,331 @@ func (h *Handler) updateNextAction(a sdk.ScalingAction) {
 	h.nextAction = a
 }
 
+// getOutOfCooldownOn returns the cooldown deadline derived from the latest
+// ledger event and the current policy. It returns the zero time when no event
+// exists, preserving the previous representation of "no cooldown".
 func (h *Handler) getOutOfCooldownOn() time.Time {
-	h.cooldownLock.RLock()
-	defer h.cooldownLock.RUnlock()
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
 
-	return h.outOfCooldownOn
+	return h.cooldownDeadlineLocked()
 }
 
-func (h *Handler) updateOutOfCooldownOn(ooc time.Time) {
-	h.cooldownLock.Lock()
-	defer h.cooldownLock.Unlock()
+// currentCooldownDeadline returns the derived deadline and whether an event
+// exists. It is used to surface a recomputed deadline after a policy update.
+func (h *Handler) currentCooldownDeadline() (time.Time, bool) {
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
 
-	h.outOfCooldownOn = ooc
+	if h.latestEvent == nil {
+		return time.Time{}, false
+	}
+	return h.cooldownDeadlineLocked(), true
+}
+
+// cooldownDeadlineLocked computes event.time + the event's cooldown. Callers
+// must hold ledgerLock.
+func (h *Handler) cooldownDeadlineLocked() time.Time {
+	if h.latestEvent == nil {
+		return time.Time{}
+	}
+	return h.latestEvent.time.Add(eventCooldown(h.latestEvent, h.policy))
+}
+
+// cooldownExpired reports whether the cooldown from the latest event has
+// elapsed. With no event there is nothing to wait for. The check is inclusive
+// so an event with a zero cooldown (deadline equal to its time) is immediately
+// treated as expired.
+func (h *Handler) cooldownExpired(now time.Time) bool {
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
+
+	if h.latestEvent == nil {
+		return true
+	}
+	return !now.Before(h.cooldownDeadlineLocked())
+}
+
+// nowTime returns the current time through the handler's own clock. The clock
+// defaults to the package-level nowFunc but can be replaced per handler in
+// tests without racing an in-flight scaling goroutine.
+func (h *Handler) nowTime() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return nowFunc()
+}
+
+// remainingCooldownUntil returns the time left on the current cooldown,
+// floored at zero for log output.
+func (h *Handler) remainingCooldownUntil(now time.Time) time.Duration {
+	deadline := h.getOutOfCooldownOn()
+	remaining := deadline.Sub(now)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// recordEvent stores the event as the latest ledger entry and, when it still
+// carries a positive remaining cooldown, places the handler in StateCooldown.
+// An event older than its cooldown is retained but leaves the handler Idle. It
+// returns the applied cooldown duration for logging. ledgerLock is acquired
+// before stateLock to respect the handler's lock ordering.
+func (h *Handler) recordEvent(e *scalingEvent) time.Duration {
+	h.ledgerLock.Lock()
+	h.latestEvent = e
+	cd := eventCooldown(e, h.policy)
+	remaining := remainingCooldown(cd, e.time, h.nowTime())
+	h.ledgerLock.Unlock()
+
+	h.log.Debug("recording scaling event",
+		"direction", e.direction, "count_before", e.countBefore,
+		"count_after", e.countAfter, "source", e.source,
+		"dry_run", e.dryRun, "cooldown", cd, "remaining", remaining)
+
+	if remaining > 0 {
+		h.updateState(StateCooldown)
+	}
+	return cd
+}
+
+func (h *Handler) getLastObservedCount() int64 {
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
+
+	return h.lastObservedCount
+}
+
+func (h *Handler) getRequestedCount() int64 {
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
+
+	return h.requestedCount
+}
+
+// stabilityHold reports whether the target's most recent reading was not
+// settled. A count that just moved (whether converging on an outstanding local
+// request or changed externally) is not stable yet, so a new scale may only be
+// launched from Idle when the latest reading repeated the previous count.
+func (h *Handler) stabilityHold() bool {
+	h.ledgerLock.RLock()
+	defer h.ledgerLock.RUnlock()
+
+	return !h.lastTickStable
+}
+
+// armOutstandingRequest records that this process has submitted a scale that
+// the target is expected to converge on. Dry-run actions never change the
+// target count, so they do not arm the gate and cannot trigger a spurious
+// out-of-band event.
+func (h *Handler) armOutstandingRequest(requestedCount int64, dryRun bool) {
+	if dryRun {
+		return
+	}
+
+	h.ledgerLock.Lock()
+	defer h.ledgerLock.Unlock()
+
+	h.hasOutstandingRequest = true
+	h.requestedCount = requestedCount
+	h.inconsistentSet = false
+	h.inconsistentTicks = 0
+	h.windowFromCount = h.lastObservedCount
+	h.windowToCount = h.lastObservedCount
+	h.lastTickStable = false
+}
+
+// clearOutstandingRequest drops the pending convergence expectation and resets
+// the inconsistency window. Used on no-op, error and stability-timeout paths.
+func (h *Handler) clearOutstandingRequest() {
+	h.ledgerLock.Lock()
+	defer h.ledgerLock.Unlock()
+
+	h.clearOutstandingRequestLocked()
+}
+
+func (h *Handler) clearOutstandingRequestLocked() {
+	h.hasOutstandingRequest = false
+	h.requestedCount = 0
+	h.inconsistentSet = false
+	h.inconsistentTicks = 0
+	h.windowFromCount = 0
+	h.windowToCount = 0
+	// With no outstanding request there is nothing to converge on, so the
+	// handler must not be left in a stability hold waiting for it.
+	h.lastTickStable = true
+}
+
+// isDryRun reports whether the target is configured for dry-run scaling.
+func (h *Handler) isDryRun() bool {
+	return h.policy.Target.Config["dry-run"] == "true"
+}
+
+// reconcileObservation updates the observation bookkeeping from a fresh target
+// status and records any out-of-band scaling events. All bookkeeping is done
+// under ledgerLock; resulting events are recorded after releasing it because
+// recordEvent takes the lock itself and then stateLock.
+//
+// The bounded wait counts evaluations from the first reading that does not
+// match the settled baseline. The same monotonic inconsistentTicks counter is
+// used for both situations so the wait is always at most
+// stabilityGateIntervalMultiplier evaluations, measured from that first
+// inconsistent reading and never extended by later readings:
+//
+//   - While a local request is outstanding, any reading not equal to the
+//     requested count is inconsistent; reaching the requested count clears the
+//     request, so a target legitimately converging over several evaluations
+//     cannot trigger the bound early.
+//   - With no outstanding request, the first changed reading opens the window;
+//     subsequent readings (moving or settled) accumulate it. This bounds a
+//     target that keeps changing as well as one that settles on a new value.
+func (h *Handler) reconcileObservation(status *sdk.TargetStatus, now time.Time) {
+	h.ledgerLock.Lock()
+
+	var pending []*scalingEvent
+	count := status.Count
+
+	// A newer last-event timestamp indicates target-side activity. While a
+	// local request is outstanding this is normally our own action propagating
+	// through the target's event stream, so consume the timestamp without
+	// double-counting it.
+	if ts, err := parseLastEventTS(status); err != nil {
+		h.log.Warn("unable to parse target last event timestamp", "error", err)
+	} else if ts != 0 && ts > h.lastMetaEventNano {
+		h.lastMetaEventNano = ts
+		if !h.hasOutstandingRequest {
+			pending = append(pending, &scalingEvent{
+				time:        clampEventTime(time.Unix(0, ts).UTC(), now),
+				direction:   sdk.ScaleDirectionNone,
+				countBefore: count,
+				countAfter:  count,
+				source:      scalingEventSourceOutOfBand,
+			})
+			h.log.Debug("detected out-of-band scaling activity",
+				"previous_count", count, "observed_count", count,
+				"reason", "meta-timestamp")
+		}
+	}
+
+	// First successful reading only establishes the baseline.
+	if !h.hasObserved {
+		h.hasObserved = true
+		h.lastObservedCount = count
+		h.lastTickStable = !h.hasOutstandingRequest
+		h.ledgerLock.Unlock()
+		h.flushEvents(pending)
+		return
+	}
+
+	countChanged := count != h.lastObservedCount
+
+	switch {
+	case h.hasOutstandingRequest:
+		h.reconcileOutstandingLocked(count, countChanged, now, &pending)
+
+	case countChanged || h.inconsistentSet:
+		// An externally driven value with no local request. The first changed
+		// reading opens the window anchored at the previous baseline; the
+		// counter is monotonic so later movement cannot extend the bound.
+		if !h.inconsistentSet {
+			h.inconsistentSet = true
+			h.windowFromCount = h.lastObservedCount
+		}
+		h.windowToCount = count
+		h.inconsistentTicks++
+		h.lastTickStable = false
+
+		if h.inconsistentTicks >= stabilityGateIntervalMultiplier {
+			pending = append(pending, &scalingEvent{
+				time:        now,
+				direction:   inferDirection(h.windowFromCount, count),
+				countBefore: h.windowFromCount,
+				countAfter:  count,
+				source:      scalingEventSourceOutOfBand,
+			})
+			h.log.Debug("detected out-of-band scaling activity",
+				"previous_count", h.windowFromCount, "observed_count", count,
+				"reason", "stability-timeout",
+				"inconsistent_evaluations", h.inconsistentTicks)
+			h.resetInconsistencyWindowLocked()
+			// The new value is now the baseline, so the target is stable for any
+			// subsequent scaling decision.
+			h.lastTickStable = true
+		}
+
+	default:
+		// No request, no movement and no open window: the settled baseline is
+		// stable.
+		h.lastTickStable = true
+	}
+
+	h.lastObservedCount = count
+	h.ledgerLock.Unlock()
+
+	h.flushEvents(pending)
+}
+
+// reconcileOutstandingLocked handles the observation while a local scaling
+// request is outstanding. Callers must hold ledgerLock; any resulting event is
+// appended to pending.
+func (h *Handler) reconcileOutstandingLocked(count int64, countChanged bool, now time.Time, pending *[]*scalingEvent) {
+	if !countChanged && count == h.requestedCount {
+		// Two consecutive identical readings at the requested count confirm the
+		// target has stabilised on this process's request.
+		h.log.Debug("target reached requested count, clearing outstanding request",
+			"observed", count, "requested", h.requestedCount)
+		h.clearOutstandingRequestLocked()
+		h.resetInconsistencyWindowLocked()
+		h.lastTickStable = true
+		return
+	}
+
+	// Any reading that is not the requested count is an inconsistent one. The
+	// count is monotonic so flapping or a target that never converges is still
+	// bounded; record the anchor count when the window first opens.
+	if !h.inconsistentSet {
+		h.inconsistentSet = true
+		h.windowFromCount = h.lastObservedCount
+	}
+	h.inconsistentTicks++
+	h.windowToCount = count
+	h.lastTickStable = false
+
+	if h.inconsistentTicks >= stabilityGateIntervalMultiplier {
+		*pending = append(*pending, &scalingEvent{
+			time:        now,
+			direction:   inferDirection(h.windowFromCount, count),
+			countBefore: h.windowFromCount,
+			countAfter:  count,
+			source:      scalingEventSourceOutOfBand,
+		})
+		h.log.Debug("detected out-of-band scaling activity",
+			"previous_count", h.windowFromCount, "observed_count", count,
+			"reason", "stability-timeout",
+			"inconsistent_evaluations", h.inconsistentTicks)
+		// The observed reality supersedes the unmet request; close the window
+		// so the same difference is not reported repeatedly.
+		h.clearOutstandingRequestLocked()
+		h.resetInconsistencyWindowLocked()
+	}
+}
+
+// resetInconsistencyWindowLocked clears the bounded-wait bookkeeping. Callers
+// must hold ledgerLock.
+func (h *Handler) resetInconsistencyWindowLocked() {
+	h.inconsistentSet = false
+	h.inconsistentTicks = 0
+	h.windowFromCount = 0
+	h.windowToCount = 0
+}
+
+// flushEvents records events produced while ledgerLock was held. The events
+// were already timestamped (and clamped where required) before this call.
+func (h *Handler) flushEvents(events []*scalingEvent) {
+	for _, e := range events {
+		h.recordEvent(e)
+	}
 }
 
 // calculateRemainingCooldown calculates the remaining cooldown based on the

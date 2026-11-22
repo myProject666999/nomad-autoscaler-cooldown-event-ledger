@@ -157,8 +157,7 @@ func TestHandler_WaitAndScale(t *testing.T) {
 				limiter:          limiter,
 				targetController: target,
 				state:            StateWaitingTurn,
-				outOfCooldownOn:  time.Time{},
-				nextAction:       sdk.ScalingAction{Count: 5},
+				nextAction:       sdk.ScalingAction{Count: 5, Direction: sdk.ScaleDirectionDown},
 			}
 
 			err := handler.waitAndScale(context.Background())
@@ -597,9 +596,9 @@ func TestNewPolicyHandler_InitialTargetStatusErrorFails(t *testing.T) {
 	t.Parallel()
 
 	h, err := NewPolicyHandler(HandlerConfig{
-		Log:      hclog.NewNullLogger(),
-		Policy:   policy2,
-		Limiter:  NewLimiter(DefaultLimiterTimeout, map[string]int{"horizontal": 1, "cluster": 1}),
+		Log:         hclog.NewNullLogger(),
+		Policy:      policy2,
+		Limiter:     NewLimiter(DefaultLimiterTimeout, map[string]int{"horizontal": 1, "cluster": 1}),
 		UpdatesChan: make(chan *sdk.ScalingPolicy, 1),
 		TargetController: &mockTargetController{
 			statusErr: errTest,
@@ -749,6 +748,7 @@ func TestHandler_Run_ScalingNeededAndCooldown_Integration(t *testing.T) {
 	go handler.Run(ctx)
 	time.Sleep(30 * time.Millisecond)
 	cancel()
+	handler.waitForInFlightScales()
 
 	must.True(t, mtc.getScaleCalled())
 	must.Eq(t, StateCooldown, handler.getState())
@@ -894,9 +894,22 @@ func TestHandler_Run_StateChanges_Integration(t *testing.T) {
 				limiter: &MockLimiter{
 					delay: tc.slotDelay,
 				},
-				outOfCooldownOn: tc.initialCooldownEnd,
-				nextAction:      sdk.ScalingAction{},
+				nextAction: sdk.ScalingAction{},
 			}
+
+			// Seed the ledger with an up event whose derived deadline matches
+			// the previous fixed outOfCooldownOn test fixture.
+			if !tc.initialCooldownEnd.IsZero() {
+				handler.recordEvent(&scalingEvent{
+					time:      tc.initialCooldownEnd.Add(-policy.CooldownOnScaleUp),
+					direction: sdk.ScaleDirectionUp,
+					source:    scalingEventSourceLocal,
+				})
+			}
+
+			// recordEvent moves the handler into Cooldown; restore the case's
+			// intended starting state for the assertions below.
+			handler.updateState(tc.initialHandlerState)
 
 			must.NoError(t, handler.applyPolicyState(handler.policy))
 
